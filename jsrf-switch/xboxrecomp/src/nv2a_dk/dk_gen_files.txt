@@ -1,0 +1,7 @@
+# The shader generators' sources, relative to this folder. Their hash is the
+# shader pack's stamp (nv2a_dk_pack.h): change any of them and the console
+# builds its pack anew. Read by CMakeLists.txt and switch/dk_pack.sh.
+dk_shadergen.h
+dk_shadergen.c
+dk_gen.c
+../../third_party/uam/source/compiler_iface.cpp

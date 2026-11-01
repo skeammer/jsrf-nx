@@ -1,0 +1,38 @@
+# Game-derived: never commit these. The lifted C is generated from your own
+# default.xbe (see README), the NRO contains it, and the rest is the game.
+jsrf-switch/src/recomp/gen/*
+!jsrf-switch/src/recomp/gen/README.md
+*.nro
+*.nacp
+*.elf
+*.xbe
+!jsrf-switch/xboxrecomp/tools/conformance/test.xbe
+*.iso
+*.xiso
+dk_shaders.pak
+dk_keys.bin
+prof.bin
+game_files/
+switch_sd/
+default.xbe
+
+# Build output
+jsrf-switch/build-*/
+build/
+*.o
+*.a
+__pycache__/
+*.pyc
+
+# Logs and console dumps (may hold game memory)
+logs/
+*_log.txt
+xbox_kernel*.log
+core
+core.*
+
+# Toolkit disassembly of the XBE
+jsrf-switch/xboxrecomp/tools/*/output/
+
+# Your own homebrew-menu icon (256x256 JPEG), if you want one
+jsrf-switch/assets/icon.jpg

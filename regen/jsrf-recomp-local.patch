@@ -1,0 +1,586 @@
+diff --git a/diagnostics/jsrf_first_fault/regenerate.sh b/diagnostics/jsrf_first_fault/regenerate.sh
+index 5b003c7..0844619 100755
+--- a/diagnostics/jsrf_first_fault/regenerate.sh
++++ b/diagnostics/jsrf_first_fault/regenerate.sh
+@@ -240,6 +240,14 @@ cp templates/runtime/recomp_types.h "$OUT/gen/recomp_types.h"
+ "$PYTHON" diagnostics/jsrf_first_fault/recover_midfunction_entries.py \
+     --output "$OUT"
+ 
++# Match the NFSU2 section-scoped MMIO path. Run after recovery so XPP/DSOUND
++# entries added by the recovery pass receive the same treatment as detected
++# functions; this only touches functions whose starts lie in these XBE sections.
++"$PYTHON" -m tools.recomp.mmio_rewrite \
++    --xbe "$XBE" \
++    --gen-dir "$OUT/gen" \
++    --mmio-sections DSOUND,XPP
++
+ # ── Generation manifest ───────────────────────────────────────────────────
+ #
+ # WHY. A translator fix does nothing until the title is regenerated, and
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index d0b9bc7..7d538f8 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -635,6 +635,46 @@ static inline uintptr_t recomp_guest_ptr(uint32_t va) {
+ #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
+ #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+ 
++/* The Switch runtime opts into MMIO dispatch. The macOS reference has no
++ * dispatcher and keeps the original direct-memory behavior. */
++#if defined(RECOMP_MMIO_RUNTIME)
++#define XBOX_MMIO_BASE 0xFD000000u
++uint32_t xbox_mmio_read(uint32_t va, unsigned size);
++void xbox_mmio_write(uint32_t va, uint32_t value, unsigned size);
++#define XBOX_IS_MMIO(addr) ((uint32_t)(addr) >= XBOX_MMIO_BASE)
++#define MMIO_RD8(addr) \
++    (XBOX_IS_MMIO(addr) ? (uint8_t)xbox_mmio_read((uint32_t)(addr), 1) : MEM8(addr))
++#define MMIO_RD16(addr) \
++    (XBOX_IS_MMIO(addr) ? (uint16_t)xbox_mmio_read((uint32_t)(addr), 2) : MEM16(addr))
++#define MMIO_RD32(addr) \
++    (XBOX_IS_MMIO(addr) ? xbox_mmio_read((uint32_t)(addr), 4) : MEM32(addr))
++#define MMIO_WR8(addr, value) do { \
++    uint32_t _ma = (uint32_t)(addr); \
++    uint8_t _mv = (uint8_t)(value); \
++    if (XBOX_IS_MMIO(_ma)) xbox_mmio_write(_ma, _mv, 1); \
++    else MEM8(_ma) = _mv; \
++} while (0)
++#define MMIO_WR16(addr, value) do { \
++    uint32_t _ma = (uint32_t)(addr); \
++    uint16_t _mv = (uint16_t)(value); \
++    if (XBOX_IS_MMIO(_ma)) xbox_mmio_write(_ma, _mv, 2); \
++    else MEM16(_ma) = _mv; \
++} while (0)
++#define MMIO_WR32(addr, value) do { \
++    uint32_t _ma = (uint32_t)(addr); \
++    uint32_t _mv = (uint32_t)(value); \
++    if (XBOX_IS_MMIO(_ma)) xbox_mmio_write(_ma, _mv, 4); \
++    else MEM32(_ma) = _mv; \
++} while (0)
++#else
++#define MMIO_RD8(addr) MEM8(addr)
++#define MMIO_RD16(addr) MEM16(addr)
++#define MMIO_RD32(addr) MEM32(addr)
++#define MMIO_WR8(addr, value) do { MEM8(addr) = (uint8_t)(value); } while (0)
++#define MMIO_WR16(addr, value) do { MEM16(addr) = (uint16_t)(value); } while (0)
++#define MMIO_WR32(addr, value) do { MEM32(addr) = (uint32_t)(value); } while (0)
++#endif
++
+ /* Explicit translated-store seam.
+  *
+  * MEM8/MEM16/MEM32 must remain lvalues because generated reads use the same
+@@ -706,6 +746,63 @@ static inline void RECOMP_MEM_WRITED(uint32_t pc, uint32_t function,
+     RECOMP_MEM_WRITE64(pc, function, addr, bits);
+ }
+ 
++/* Device registers are 32-bit on this path. Preserve normal memory-watch
++ * stores, and split a guest 64-bit MMIO store into two bus-width writes. */
++#if defined(RECOMP_MMIO_RUNTIME)
++#define RECOMP_MMIO_MEM_WRITE_HELPER(bits, type, pc, function, addr, value) do { \
++    uint32_t _mmio_addr = (uint32_t)(addr);                                  \
++    type _mmio_value = (type)(value);                                        \
++    if (XBOX_IS_MMIO(_mmio_addr))                                            \
++        xbox_mmio_write(_mmio_addr, (uint32_t)_mmio_value, (bits) / 8u);     \
++    else                                                                     \
++        RECOMP_MEM_WRITE_HELPER(bits, type, pc, function,                    \
++                                _mmio_addr, _mmio_value);                    \
++} while (0)
++#define RECOMP_MMIO_MEM_WRITE8(pc, function, addr, value) \
++    RECOMP_MMIO_MEM_WRITE_HELPER(8, uint8_t, pc, function, addr, value)
++#define RECOMP_MMIO_MEM_WRITE16(pc, function, addr, value) \
++    RECOMP_MMIO_MEM_WRITE_HELPER(16, uint16_t, pc, function, addr, value)
++#define RECOMP_MMIO_MEM_WRITE32(pc, function, addr, value) \
++    RECOMP_MMIO_MEM_WRITE_HELPER(32, uint32_t, pc, function, addr, value)
++
++static inline void RECOMP_MMIO_MEM_WRITE64(uint32_t pc, uint32_t function,
++                                           uint32_t addr, uint64_t value) {
++    if (XBOX_IS_MMIO(addr)) {
++        xbox_mmio_write(addr, (uint32_t)value, 4);
++        xbox_mmio_write(addr + 4u, (uint32_t)(value >> 32), 4);
++    } else {
++        RECOMP_MEM_WRITE64(pc, function, addr, value);
++    }
++}
++
++static inline void RECOMP_MMIO_MEM_WRITEF(uint32_t pc, uint32_t function,
++                                          uint32_t addr, float value) {
++    uint32_t bits;
++    memcpy(&bits, &value, sizeof bits);
++    RECOMP_MMIO_MEM_WRITE32(pc, function, addr, bits);
++}
++
++static inline void RECOMP_MMIO_MEM_WRITED(uint32_t pc, uint32_t function,
++                                          uint32_t addr, double value) {
++    uint64_t bits;
++    memcpy(&bits, &value, sizeof bits);
++    RECOMP_MMIO_MEM_WRITE64(pc, function, addr, bits);
++}
++#else
++#define RECOMP_MMIO_MEM_WRITE8(pc, function, addr, value) \
++    RECOMP_MEM_WRITE8(pc, function, addr, value)
++#define RECOMP_MMIO_MEM_WRITE16(pc, function, addr, value) \
++    RECOMP_MEM_WRITE16(pc, function, addr, value)
++#define RECOMP_MMIO_MEM_WRITE32(pc, function, addr, value) \
++    RECOMP_MEM_WRITE32(pc, function, addr, value)
++#define RECOMP_MMIO_MEM_WRITE64(pc, function, addr, value) \
++    RECOMP_MEM_WRITE64(pc, function, addr, value)
++#define RECOMP_MMIO_MEM_WRITEF(pc, function, addr, value) \
++    RECOMP_MEM_WRITEF(pc, function, addr, value)
++#define RECOMP_MMIO_MEM_WRITED(pc, function, addr, value) \
++    RECOMP_MEM_WRITED(pc, function, addr, value)
++#endif
++
+ /** FS-segmented accesses retain their per-thread segment base. */
+ #define FS_MEM8(addr)  MEM8(g_fs_base + (uint32_t)(addr))
+ #define FS_MEM16(addr) MEM16(g_fs_base + (uint32_t)(addr))
+diff --git a/tools/recomp/mmio_rewrite.py b/tools/recomp/mmio_rewrite.py
+new file mode 100644
+index 0000000..fdee226
+--- /dev/null
++++ b/tools/recomp/mmio_rewrite.py
+@@ -0,0 +1,343 @@
++"""Rewrite generated DSOUND/XPP accesses through the runtime MMIO model."""
++
++import argparse
++import re
++from pathlib import Path
++
++from . import config
++
++
++_ACCESS = re.compile(r"(?<![A-Za-z0-9_])(S?)MEM(8|16|32)\(")
++_ASSIGN = re.compile(r"\s*(<<=|>>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|=(?!=))")
++_STORE = re.compile(
++    r"(?<![A-Za-z0-9_])RECOMP_MEM_WRITE(8|16|32|64|F|D)\s*\("
++)
++_FUNCTION = re.compile(
++    r"(?m)^void\s+sub_([0-9A-Fa-f]{8})\s*\(\s*void\s*\)\s*\{"
++)
++_SIGNED = {"8": "int8_t", "16": "int16_t", "32": "int32_t"}
++
++
++def _matching_delimiter(text, start):
++    """Index just past the matching delimiter at ``start``."""
++    pairs = {"(": ")", "{": "}", "[": "]"}
++    opening = text[start]
++    if opening not in pairs:
++        raise ValueError(f"expected an opening delimiter at offset {start}")
++
++    depth = 0
++    quote = None
++    line_comment = False
++    block_comment = False
++    escaped = False
++    i = start
++    while i < len(text):
++        char = text[i]
++        following = text[i + 1] if i + 1 < len(text) else ""
++
++        if line_comment:
++            if char == "\n":
++                line_comment = False
++        elif block_comment:
++            if char == "*" and following == "/":
++                block_comment = False
++                i += 1
++        elif quote:
++            if escaped:
++                escaped = False
++            elif char == "\\":
++                escaped = True
++            elif char == quote:
++                quote = None
++        elif char == "/" and following == "/":
++            line_comment = True
++            i += 1
++        elif char == "/" and following == "*":
++            block_comment = True
++            i += 1
++        elif char in ('"', "'"):
++            quote = char
++        elif char == opening:
++            depth += 1
++        elif char == pairs[opening]:
++            depth -= 1
++            if depth == 0:
++                return i + 1
++        i += 1
++
++    raise ValueError(f"unbalanced {opening!r} in generated code")
++
++
++def _split_arguments(text):
++    """Split call arguments on commas outside nested expressions or comments."""
++    arguments = []
++    start = 0
++    stack = []
++    quote = None
++    line_comment = False
++    block_comment = False
++    escaped = False
++    pairs = {")": "(", "]": "[", "}": "{"}
++    i = 0
++
++    while i < len(text):
++        char = text[i]
++        following = text[i + 1] if i + 1 < len(text) else ""
++
++        if line_comment:
++            if char == "\n":
++                line_comment = False
++        elif block_comment:
++            if char == "*" and following == "/":
++                block_comment = False
++                i += 1
++        elif quote:
++            if escaped:
++                escaped = False
++            elif char == "\\":
++                escaped = True
++            elif char == quote:
++                quote = None
++        elif char == "/" and following == "/":
++            line_comment = True
++            i += 1
++        elif char == "/" and following == "*":
++            block_comment = True
++            i += 1
++        elif char in ('"', "'"):
++            quote = char
++        elif char in "([{":
++            stack.append(char)
++        elif char in ")]}":
++            if not stack or stack.pop() != pairs[char]:
++                raise ValueError("unbalanced delimiters in MMIO store arguments")
++        elif char == "," and not stack:
++            arguments.append(text[start:i].strip())
++            start = i + 1
++        i += 1
++
++    if stack or quote or block_comment:
++        raise ValueError("unterminated expression in MMIO store arguments")
++    last = text[start:].strip()
++    if last or arguments:
++        arguments.append(last)
++    return arguments
++
++
++def _statement_end(text, start):
++    """Index of the semicolon ending the expression that starts at ``start``."""
++    depth = 0
++    quote = None
++    line_comment = False
++    block_comment = False
++    escaped = False
++    i = start
++    while i < len(text):
++        char = text[i]
++        following = text[i + 1] if i + 1 < len(text) else ""
++
++        if line_comment:
++            if char == "\n":
++                line_comment = False
++        elif block_comment:
++            if char == "*" and following == "/":
++                block_comment = False
++                i += 1
++        elif quote:
++            if escaped:
++                escaped = False
++            elif char == "\\":
++                escaped = True
++            elif char == quote:
++                quote = None
++        elif char == "/" and following == "/":
++            line_comment = True
++            i += 1
++        elif char == "/" and following == "*":
++            block_comment = True
++            i += 1
++        elif char in ('"', "'"):
++            quote = char
++        elif char in "([{":
++            depth += 1
++        elif char in ")]}":
++            depth -= 1
++        elif char == ";" and depth == 0:
++            return i
++        i += 1
++
++    raise ValueError("unterminated statement in generated code")
++
++
++def _rewrite_store_calls(code):
++    out = []
++    pos = 0
++    while True:
++        match = _STORE.search(code, pos)
++        if not match:
++            out.append(code[pos:])
++            return "".join(out)
++
++        out.append(code[pos:match.start()])
++        close = _matching_delimiter(code, match.end() - 1)
++        arguments = _split_arguments(code[match.end():close - 1])
++        if len(arguments) != 4:
++            raise ValueError(
++                f"{match.group(0)[:-1]} expects 4 arguments, got {len(arguments)}"
++            )
++        arguments = [rewrite(argument) for argument in arguments]
++        out.append(
++            f"RECOMP_MMIO_MEM_WRITE{match.group(1)}("
++            + ", ".join(arguments)
++            + ")"
++        )
++        pos = close
++
++
++def _rewrite_memory_accesses(code):
++    out = []
++    pos = 0
++    while True:
++        match = _ACCESS.search(code, pos)
++        if not match:
++            out.append(code[pos:])
++            return "".join(out)
++
++        out.append(code[pos:match.start()])
++        signed, bits = match.group(1), match.group(2)
++        close = _matching_delimiter(code, match.end() - 1)
++        address = rewrite(code[match.end():close - 1])
++        assignment = _ASSIGN.match(code, close)
++        if assignment:
++            operator = assignment.group(1)
++            end = _statement_end(code, assignment.end())
++            value = rewrite(code[assignment.end():end].strip())
++            current = f"MMIO_RD{bits}({address})"
++            if signed:
++                current = f"(({_SIGNED[bits]}){current})"
++            if operator == "=":
++                out.append(f"MMIO_WR{bits}({address}, ({value}))")
++            else:
++                out.append(
++                    f"MMIO_WR{bits}({address}, "
++                    f"{current} {operator[:-1]} ({value}))"
++                )
++            pos = end
++            continue
++
++        read = f"MMIO_RD{bits}({address})"
++        if signed:
++            read = f"(({_SIGNED[bits]}){read})"
++        out.append(read)
++        pos = close
++
++
++def rewrite(code):
++    """Rewrite raw accesses and memory-watch stores in one generated function."""
++    return _rewrite_memory_accesses(_rewrite_store_calls(code))
++
++
++def _function_end(source, open_brace):
++    return _matching_delimiter(source, open_brace)
++
++
++def rewrite_generated_source(source, section_ranges):
++    """Rewrite only function definitions whose start VA belongs to a section."""
++    out = []
++    pos = 0
++    selected = 0
++    changed = 0
++    for match in _FUNCTION.finditer(source):
++        if match.start() < pos:
++            continue
++        address = int(match.group(1), 16)
++        if not any(start <= address < end for start, end in section_ranges):
++            continue
++
++        end = _function_end(source, match.end() - 1)
++        original = source[match.start():end]
++        rewritten = rewrite(original)
++        out.append(source[pos:match.start()])
++        out.append(rewritten)
++        pos = end
++        selected += 1
++        changed += rewritten != original
++
++    out.append(source[pos:])
++    return "".join(out), selected, changed
++
++
++def rewrite_generated_dir(gen_dir, section_ranges):
++    """Apply the section rewrite to generated C files, including recovered stubs."""
++    root = Path(gen_dir)
++    paths = sorted(root.glob("recomp_*.c"))
++    if not paths:
++        raise ValueError(f"no recomp_*.c files found in {root}")
++
++    files_changed = 0
++    functions_selected = 0
++    functions_changed = 0
++    for path in paths:
++        original = path.read_text()
++        rewritten, selected, changed = rewrite_generated_source(
++            original, section_ranges
++        )
++        functions_selected += selected
++        functions_changed += changed
++        if rewritten != original:
++            path.write_text(rewritten)
++            files_changed += 1
++
++    if not functions_selected:
++        raise ValueError(
++            f"no generated functions found in requested sections under {root}"
++        )
++    return files_changed, functions_selected, functions_changed
++
++
++def _section_ranges(names):
++    sections = {
++        name: (start, start + size)
++        for name, start, size, _raw_addr in config.SECTIONS
++    }
++    missing = [name for name in names if name not in sections]
++    if missing:
++        raise ValueError(
++            "XBE does not contain requested section(s): " + ", ".join(missing)
++        )
++    return [sections[name] for name in names]
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--xbe", required=True, help="XBE used for section ranges")
++    parser.add_argument("--gen-dir", required=True, help="generated C directory")
++    parser.add_argument(
++        "--mmio-sections",
++        required=True,
++        help="comma-separated XBE section names, for example DSOUND,XPP",
++    )
++    args = parser.parse_args(argv)
++    names = list(dict.fromkeys(
++        name.strip() for name in args.mmio_sections.split(",") if name.strip()
++    ))
++    if not names:
++        parser.error("--mmio-sections must name at least one section")
++
++    try:
++        config.configure_from_xbe(args.xbe)
++        ranges = _section_ranges(names)
++        files, selected, changed = rewrite_generated_dir(args.gen_dir, ranges)
++    except (OSError, ValueError) as exc:
++        parser.error(str(exc))
++
++    print(
++        "MMIO rewrite "
++        f"{','.join(names)}: selected {selected} functions, modified "
++        f"{changed} across {files} file(s)"
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/recomp/test_mmio_rewrite.py b/tools/recomp/test_mmio_rewrite.py
+new file mode 100644
+index 0000000..9c9b672
+--- /dev/null
++++ b/tools/recomp/test_mmio_rewrite.py
+@@ -0,0 +1,97 @@
++"""Tests for the JSRF-specific MMIO rewrite."""
++
++import unittest
++
++from tools.recomp.mmio_rewrite import rewrite, rewrite_generated_source
++
++
++class MmioRewriteTests(unittest.TestCase):
++    def test_read_and_signed_read(self):
++        self.assertEqual(
++            rewrite("eax = MEM32(esi + 0x10);"),
++            "eax = MMIO_RD32(esi + 0x10);",
++        )
++        self.assertEqual(
++            rewrite("eax = (uint32_t)SMEM16(ecx);"),
++            "eax = (uint32_t)((int16_t)MMIO_RD16(ecx));",
++        )
++
++    def test_plain_and_compound_stores(self):
++        self.assertEqual(
++            rewrite("MEM8(eax + 4) = 2;"),
++            "MMIO_WR8(eax + 4, (2));",
++        )
++        self.assertEqual(
++            rewrite("MEM32(ebp + -4) &= 0;"),
++            "MMIO_WR32(ebp + -4, MMIO_RD32(ebp + -4) & (0));",
++        )
++
++    def test_watch_store_preserves_guest_site_and_rewrites_value(self):
++        source = (
++            "RECOMP_MEM_WRITE32(0x001BC000u, 0x001BC000u, eax, MEM32(ecx));"
++        )
++        self.assertEqual(
++            rewrite(source),
++            "RECOMP_MMIO_MEM_WRITE32(0x001BC000u, 0x001BC000u, "
++            "eax, MMIO_RD32(ecx));",
++        )
++
++    def test_small_width_watch_stores_are_routed(self):
++        for width in ("8", "16"):
++            source = f"RECOMP_MEM_WRITE{width}(pc, fn, eax, value);"
++            self.assertEqual(
++                rewrite(source),
++                f"RECOMP_MMIO_MEM_WRITE{width}(pc, fn, eax, value);",
++            )
++
++    def test_float_and_double_watch_stores_are_routed(self):
++        self.assertEqual(
++            rewrite("RECOMP_MEM_WRITEF(pc, fn, eax, fp_top());"),
++            "RECOMP_MMIO_MEM_WRITEF(pc, fn, eax, fp_top());",
++        )
++        self.assertEqual(
++            rewrite("RECOMP_MEM_WRITED(pc, fn, eax, fp_top());"),
++            "RECOMP_MMIO_MEM_WRITED(pc, fn, eax, fp_top());",
++        )
++        self.assertEqual(
++            rewrite("RECOMP_MEM_WRITE64(pc, fn, eax, value);"),
++            "RECOMP_MMIO_MEM_WRITE64(pc, fn, eax, value);",
++        )
++
++    def test_nested_commas_and_memory_accesses_in_store_arguments(self):
++        source = "RECOMP_MEM_WRITE32(pc, fn, eax, combine(a, b) + MEM16(ecx));"
++        self.assertEqual(
++            rewrite(source),
++            "RECOMP_MMIO_MEM_WRITE32(pc, fn, eax, "
++            "combine(a, b) + MMIO_RD16(ecx));",
++        )
++
++    def test_rewrite_is_idempotent(self):
++        source = (
++            "eax = MEM32(ebx); "
++            "RECOMP_MEM_WRITE32(pc, fn, eax, MEM16(ecx));"
++        )
++        once = rewrite(source)
++        self.assertEqual(rewrite(once), once)
++
++    def test_only_selected_section_functions_are_rewritten(self):
++        source = (
++            "void sub_00100000(void)\n{\n"
++            "    eax = MEM32(ebx);\n"
++            "}\n"
++            "void sub_001BC000(void)\n{\n"
++            "    RECOMP_MEM_WRITE32(pc, fn, eax, edx);\n"
++            "}\n"
++        )
++        rewritten, selected, changed = rewrite_generated_source(
++            source, [(0x001BC000, 0x001C0000)]
++        )
++        self.assertIn("eax = MEM32(ebx);", rewritten)
++        self.assertIn(
++            "RECOMP_MMIO_MEM_WRITE32(pc, fn, eax, edx);", rewritten
++        )
++        self.assertEqual((selected, changed), (1, 1))
++
++
++if __name__ == "__main__":
++    unittest.main()
